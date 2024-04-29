@@ -1,23 +1,23 @@
 import copy
 import json
+import logging
 import math
 import os
 import re
-from typing import Callable, Dict, List, Optional, Tuple, Type
+from typing import (Any, Callable, Dict, Hashable, List, Optional, Tuple, Type)
 
 import safetensors.torch
 import torch
 from torch import nn
 
 from vllm.config import LoRAConfig
-from vllm.logger import init_logger
-from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping
-from vllm.lora.lora import LoRALayerWeights, PackedLoRALayerWeights
-from vllm.lora.utils import (from_layer, from_layer_logits_processor,
-                             parse_fine_tuned_lora_name, replace_submodule)
-from vllm.utils import LRUCache, is_pin_memory_available
+from vllm.utils import LRUCache, in_wsl
 
-logger = init_logger(__name__)
+from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, from_layer, from_layer_sampler
+from vllm.lora.lora import LoRALayerWeights, PackedLoRALayerWeights
+from vllm.lora.utils import parse_fine_tuned_lora_name, replace_submodule
+
+logger = logging.getLogger(__name__)
 
 _GLOBAL_LORA_ID = 0
 
@@ -53,46 +53,44 @@ def convert_mapping(
                 embeddings.
             indices_len: List of lengths of the above tensors.
     """
-    index_mapping_indices: List[int] = list(mapping.index_mapping).copy()
-    embedding_indices = index_mapping_indices.copy()
-    lora_indices = index_mapping_indices.copy()
-    prompt_mapping: List[int] = [
+    indices = list(mapping.index_mapping).copy()
+    embedding_indices = indices.copy()
+    lora_indices = indices.copy()
+    prompt_mapping = [
         lora_index_to_id.index(x) if x > 0 else -1
         for x in mapping.prompt_mapping
     ]
     lora_idx = None
-    for i in range(len(index_mapping_indices)):
+    for i in range(len(indices)):
         # TODO index can be slow. optimize
-        lora_idx = (lora_index_to_id.index(index_mapping_indices[i])
-                    if index_mapping_indices[i] > 0 else -1)
-        embedding_indices[i] = lora_idx if index_mapping_indices[i] > 0 else 0
-        index_mapping_indices[i] = i
+        lora_idx = (lora_index_to_id.index(indices[i])
+                    if indices[i] > 0 else -1)
+        embedding_indices[i] = lora_idx if indices[i] > 0 else 0
+        indices[i] = i
         lora_indices[i] = lora_idx
 
-    indices = torch.tensor(
-        [index_mapping_indices, lora_indices, embedding_indices],
-        dtype=torch.long,
-        device="cuda")
-    prompt_mapping_tensor = torch.tensor(prompt_mapping,
-                                         device="cuda",
-                                         dtype=torch.long)
+    indices = torch.tensor([indices, lora_indices, embedding_indices],
+                           dtype=torch.long,
+                           device="cuda")
+    prompt_mapping = torch.tensor(prompt_mapping,
+                                  device="cuda",
+                                  dtype=torch.long)
     embeddings_indices = torch.stack([
         indices[2] * extra_vocab_size,
         indices[2] * (vocab_size + extra_vocab_size)
     ])
     embeddings_indices[embeddings_indices == -1] = max_loras - 1
     base_indices = indices[1]
-    sampler_indices = prompt_mapping_tensor
+    sampler_indices = prompt_mapping
     sampler_indices_padded = sampler_indices.clone()
     sampler_indices_padded[sampler_indices_padded == -1] = max_loras - 1
     sampler_indices_padded = (
         torch.arange(
             0, len(sampler_indices_padded), device="cuda", dtype=torch.long) +
         (sampler_indices_padded * len(sampler_indices_padded)))
-    indices_len = [
-        base_indices.shape[-1], sampler_indices.shape[-1],
-        sampler_indices_padded.shape[-1], embeddings_indices.shape[-1]
-    ]
+    indices_len = (base_indices.shape[-1], sampler_indices.shape[-1],
+                   sampler_indices_padded.shape[-1],
+                   embeddings_indices.shape[-1])
 
     return (base_indices, sampler_indices, sampler_indices_padded,
             embeddings_indices, indices_len)
@@ -144,14 +142,13 @@ class LoRAModel:
         embedding_padding_modules: Optional[List[str]] = None,
     ) -> "LoRAModel":
         """Create a LoRAModel from a dictionary of tensors."""
-        pin_memory = str(device) == "cpu" and is_pin_memory_available()
+        pin_memory = str(device) == "cpu" and not in_wsl()
         loras: Dict[str, LoRALayerWeights] = {}
         for tensor_name, tensor in tensors.items():
             module_name, is_lora_a = parse_fine_tuned_lora_name(tensor_name)
             if module_name not in loras:
                 lora_embeddings_tensor = None
                 if embeddings:
-                    assert embedding_modules is not None
                     embeddings_module = next(
                         (k for k in embedding_modules if k in module_name),
                         None)
@@ -174,7 +171,6 @@ class LoRAModel:
             else:
                 loras[module_name].lora_b = tensor.to(device=device,
                                                       dtype=dtype).t()
-                assert embedding_padding_modules is not None
                 if any(name in module_name
                        for name in embedding_padding_modules
                        ) and target_embedding_padding is not None:
@@ -195,7 +191,6 @@ class LoRAModel:
     def from_local_checkpoint(
         cls,
         lora_dir: str,
-        expected_lora_modules: List[str],
         lora_model_id: Optional[int] = None,
         device: str = "cuda",
         dtype: Optional[torch.dtype] = None,
@@ -211,22 +206,6 @@ class LoRAModel:
             lora_dir, "new_embeddings.safetensors")
         new_embeddings_bin_file_path = os.path.join(lora_dir,
                                                     "new_embeddings.bin")
-        with open(lora_config_path) as f:
-            config = json.load(f)
-        target_modules = config["target_modules"]
-        unexpected_modules = []
-        for module in target_modules:
-            # Compatible with more modules, such as:layers.11.self_attn.k_proj
-            part_name = module.split(".")[-1]
-            if part_name not in expected_lora_modules:
-                unexpected_modules.append(module)
-        # loaded lora's target modules must be a subset of expected_lora_modules
-        if unexpected_modules:
-            raise ValueError(
-                f"While loading {lora_dir}, expected"
-                f" target modules in {expected_lora_modules}"
-                f" but received {unexpected_modules}."
-                f" Please verify that the loaded LoRA module is correct")
         if os.path.isfile(lora_tensor_path):
             tensors = safetensors.torch.load_file(lora_tensor_path)
         elif os.path.isfile(lora_bin_file_path):
@@ -241,6 +220,8 @@ class LoRAModel:
         elif os.path.isfile(new_embeddings_bin_file_path):
             embeddings = torch.load(new_embeddings_bin_file_path)
 
+        with open(lora_config_path) as f:
+            config = json.load(f)
         rank = config["r"]
         lora_alpha = config["lora_alpha"]
         return cls.from_lora_tensors(
@@ -299,10 +280,11 @@ class LoRAModelManager:
                                               self.max_num_batched_tokens,
                                               dtype=torch.long,
                                               device="cuda")
+        self.offsets = []
         # 4 is the number of indicies tensors defined above
         # base_indices, sampler_indices, sampler_indices_padded,
         # embeddings_indices
-        self.indices_len: List[Optional[int]] = [None] * 4
+        self.indices_len = [None] * 4
 
         self.model: nn.Module = model
         if hasattr(self.model, "supported_lora_modules"):
@@ -315,7 +297,7 @@ class LoRAModelManager:
         self._registered_loras: Dict[int, LoRAModel] = {}
         # Dict instead of a Set for compatibility with LRUCache.
         self._active_loras: Dict[int, None] = {}
-        self._last_mapping: Optional[LoRAMapping] = None
+        self._last_mapping = None
         self._create_lora_modules()
         self.model.lora_manager = self
 
@@ -345,8 +327,8 @@ class LoRAModelManager:
         index, _ = first_free_slot
         self._active_loras[lora_id] = None
         lora_model = self._registered_loras[lora_id]
-        logger.debug("Activating LoRA. int id: %d, slot index: %d",
-                     lora_model.id, index)
+        logger.debug(
+            f"Activating LoRA. int id: {lora_model.id}, slot index: {index}")
         self.lora_index_to_id[index] = lora_model.id
         for module_name, module in self.modules.items():
             module_lora = lora_model.get_lora(module_name)
@@ -373,7 +355,7 @@ class LoRAModelManager:
             return True
         return False
 
-    def _add_lora(self, lora: LoRAModel):
+    def _add_lora(self, lora: LoRAModel) -> bool:
         self._create_merged_loras_inplace(lora)
         self._registered_loras[lora.id] = lora
 
@@ -421,7 +403,7 @@ class LoRAModelManager:
     def get_lora(self, lora_id: int) -> Optional[LoRAModel]:
         return self._registered_loras.get(lora_id, None)
 
-    def remove_all_loras(self):
+    def remove_all_loras(self) -> bool:
         """Remove all LoRAModels from the manager."""
         self._registered_loras.clear()
         self.lora_index_to_id = [None] * self.lora_slots
@@ -431,22 +413,18 @@ class LoRAModelManager:
         for module_name, module in self.model.named_modules():
             if not self._match_target_modules(module_name):
                 continue
-            parts = module_name.split(".")[-1]
-            packed_moduled_lst = self.packed_modules_mapping.get(parts, [])
+
             new_module = replace_submodule(
                 self.model, module_name,
                 from_layer(module, self.lora_slots, self.lora_config,
-                           packed_moduled_lst, self.model.config))
+                           self.model.config))
             # (yard1): TODO make this more robust
             if "lm_head" in module_name:
-                logits_processor_module = self.model.get_submodule(
-                    "logits_processor")
+                sampler_module = self.model.get_submodule("sampler")
                 new_module = replace_submodule(
-                    self.model, "logits_processor",
-                    from_layer_logits_processor(logits_processor_module,
-                                                module, self.lora_slots,
-                                                self.lora_config,
-                                                self.model.config))
+                    self.model, "sampler",
+                    from_layer_sampler(sampler_module, module, self.lora_slots,
+                                       self.lora_config, self.model.config))
             self.register_module(module_name, new_module)
             self._register_packed_modules(module_name)
             new_module.set_mapping(self.base_indices, self.sampler_indices,
@@ -470,7 +448,6 @@ class LoRAModelManager:
                 continue
             parts = module_name.split(".")
             if module_name not in self.packed_modules:
-                assert embedding_modules is not None
                 if parts[-1] in embedding_modules:
                     input_dim = (module.base_layer.org_vocab_size +
                                  self.lora_config.lora_extra_vocab_size if
@@ -504,7 +481,7 @@ class LoRAModelManager:
             else:
                 parts = module_name.split(".")
                 replacements = self.packed_modules_mapping[parts[-1]]
-                subloras: List[Optional["LoRALayerWeights"]] = []
+                subloras = []
                 for i, r in enumerate(replacements):
                     lora = LoRALayerWeights.create_dummy_lora_weights(
                         module_name + "." + r,
@@ -530,10 +507,8 @@ class LoRAModelManager:
     def _register_packed_modules(self, module_full_name: str) -> None:
         parts = module_full_name.split(".")
         module_name = parts[-1]
-        replacements = self.packed_modules_mapping.get(module_name, [])
-        # When replacements is less than or equal to 1, it indicates that this
-        # module is not a packed module.
-        if len(replacements) <= 1:
+        replacements = self.packed_modules_mapping.get(module_name)
+        if not replacements:
             return
         prefix = ".".join(parts[:-1])
         self.packed_modules[module_full_name] = [
@@ -542,7 +517,7 @@ class LoRAModelManager:
 
     def _create_merged_loras_inplace(self, lora_model: LoRAModel) -> None:
         for module_name, new_module_names in self.packed_modules.items():
-            replacement_loras: List[Optional[LoRALayerWeights]] = []
+            replacement_loras = []
             has_replacement = False
             for r in new_module_names:
                 lora = lora_model.get_lora(r)
@@ -559,15 +534,15 @@ class LoRAModelManager:
                 replacement_loras)
 
 
-class LoRALRUCache(LRUCache[LoRAModel]):
+class LoRALRUCache(LRUCache):
 
-    def __init__(self, capacity: int, deactivate_lora_fn: Callable[[int],
-                                                                   bool]):
+    def __init__(self, capacity: int, deactivate_lora_fn: Callable[[Hashable],
+                                                                   None]):
         super().__init__(capacity)
         self.deactivate_lora_fn = deactivate_lora_fn
 
-    def _on_remove(self, key: int, value: LoRAModel):
-        logger.debug("Removing LoRA. int id: %d", key)
+    def _on_remove(self, key: Hashable, value: Any):
+        logger.debug(f"Removing LoRA. int id: {key}")
         self.deactivate_lora_fn(key)
         return super()._on_remove(key, value)
 

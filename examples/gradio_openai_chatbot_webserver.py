@@ -1,7 +1,6 @@
 import argparse
-
-import gradio as gr
 from openai import OpenAI
+import gradio as gr
 
 # Argument parser setup
 parser = argparse.ArgumentParser(

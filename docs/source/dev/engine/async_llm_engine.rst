@@ -1,6 +1,7 @@
+
 AsyncLLMEngine
 =================================
 
-.. autoclass:: vllm.AsyncLLMEngine
-    :members:
+.. autoclass:: vllm.engine.async_llm_engine.AsyncLLMEngine
+    :members: generate, abort
     :show-inheritance:
